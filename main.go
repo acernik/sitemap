@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 )
 
 type URL struct {
@@ -25,37 +27,69 @@ type Sitemap struct {
 
 func main() {
 	var websiteURL string
-	var parallel int
+	var maxGoroutines int
 	var outPutFile string
 	var maxDepth int
 
 	flag.StringVar(&websiteURL, "url", "https://www.coastal.edu", "Specify URL to be parsed. Default is https://www.coastal.edu/ .")
-	flag.IntVar(&parallel, "parallel", 1, "Specify number of parallel workers to navigate through site. Default is 1.")
+	flag.IntVar(&maxGoroutines, "parallel", 1, "Specify number of parallel workers to navigate through site. Default is 1.")
 	flag.StringVar(&outPutFile, "output-file", "sitemap.xml", "Specify output file path. Default is sitemap.xml.")
 	flag.IntVar(&maxDepth, "max-depth", 5, "Specify max depth of URL navigation recursion. Default is 5.")
 
 	flag.Parse()
+
+	runtime.GOMAXPROCS(maxGoroutines)
 
 	u, err := url.Parse(websiteURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println("u.Scheme: ", u.Scheme)
-	fmt.Println("u.Host: ", u.Host)
-	fmt.Println("u.Path: ", u.Path)
-	fmt.Println("u.String(): ", u.String())
-
 	response, err := http.Get(u.String())
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	defer response.Body.Close()
+	sitemapURLs := make(map[string]URL)
 
-	sitemap, err := createSitemap(response.Body, u)
-	if err != nil {
-		log.Fatal(err)
+	sitemapChan := make(chan URL)
+	sitemapGroup := sync.WaitGroup{}
+	sitemapGroup.Add(1)
+	go func() {
+		for sitemapURL := range sitemapChan {
+			fmt.Printf("found sitemap URL: %s\n", sitemapURL.Location)
+			sitemapURLs[sitemapURL.Location] = sitemapURL
+		}
+		sitemapGroup.Done()
+	}()
+
+	errChan := make(chan error)
+	errGroup := sync.WaitGroup{}
+	errGroup.Add(1)
+	go func() {
+		for err := range errChan {
+			fmt.Printf("error creating sitemap: %s\n", err)
+		}
+		errGroup.Done()
+	}()
+
+	parallelGroup := sync.WaitGroup{}
+	parallelGroup.Add(1)
+
+	createSitemap(response, u, sitemapChan, errChan, &parallelGroup, maxDepth)
+
+	parallelGroup.Wait()
+
+	close(sitemapChan)
+	close(errChan)
+
+	sitemapGroup.Wait()
+	errGroup.Wait()
+
+	var sitemap Sitemap
+
+	for _, sitemapURL := range sitemapURLs {
+		sitemap.URLs = append(sitemap.URLs, sitemapURL)
 	}
 
 	err = writeSitemapToFile(outPutFile, sitemap)
@@ -64,12 +98,17 @@ func main() {
 	}
 }
 
-func createSitemap(body io.Reader, u *url.URL) (Sitemap, error) {
+func createSitemap(response *http.Response, u *url.URL, sitemapChan chan<- URL, errChan chan<- error, parallelGroup *sync.WaitGroup, maxDepth int) {
+	defer response.Body.Close()
+
+	if maxDepth == 0 {
+		parallelGroup.Done()
+		return
+	}
+
 	var baseElement string
 
-	htmlTokens := html.NewTokenizer(body)
-
-	var sitemap Sitemap
+	htmlTokens := html.NewTokenizer(response.Body)
 
 loop:
 	for {
@@ -97,7 +136,7 @@ loop:
 
 						link := baseURL + attr.Val
 
-						if strings.HasPrefix(attr.Val, "http") || strings.HasPrefix(attr.Val, "www") {
+						if strings.HasPrefix(attr.Val, "http") {
 							if !strings.HasPrefix(attr.Val, baseURL) {
 								continue
 							}
@@ -108,9 +147,25 @@ loop:
 							}
 						}
 
-						sitemap.URLs = append(sitemap.URLs, URL{
-							Location: link,
-						})
+						sitemapChan <- URL{Location: link}
+
+						nextURL, err := url.Parse(link)
+						if err != nil {
+							errChan <- err
+							continue
+						}
+
+						resp, err := http.Get(nextURL.String())
+						if err != nil {
+							errChan <- err
+							break
+						}
+
+						if maxDepth > 0 {
+							maxDepth -= 1
+							parallelGroup.Add(1)
+							go createSitemap(resp, nextURL, sitemapChan, errChan, parallelGroup, maxDepth)
+						}
 					}
 				}
 			}
@@ -120,7 +175,8 @@ loop:
 					if attr.Key == "href" {
 						baseElementURL, err := url.Parse(attr.Val)
 						if err != nil {
-							return sitemap, err
+							errChan <- err
+							continue
 						}
 
 						baseElement = baseElementURL.String()
@@ -132,7 +188,7 @@ loop:
 		}
 	}
 
-	return sitemap, nil
+	parallelGroup.Done()
 }
 
 func writeSitemapToFile(filename string, sitemap Sitemap) error {
